@@ -68,6 +68,9 @@ def fetch_schedule():
         if not cells: continue
         texts = [c.get_text(separator=" ", strip=True) for c in cells]
         first_text = texts[0].upper()
+        
+        if not first_text: continue
+
         if "-" in first_text and len(first_text) < 10 and " " not in first_text:
             current_group = first_text
             if current_group not in groups_data: groups_data[current_group] = []
@@ -113,20 +116,25 @@ def auto_update_task():
 # ==========================================
 bot = telebot.TeleBot(TOKEN)
 
-def send_group_keyboard(chat_id, message_id=None, is_group_chat=False):
+def send_main_keyboard(chat_id, message_id=None, is_group_chat=False):
     if not DATA:
         bot.send_message(chat_id, "⏳ Данные еще загружаются...")
         return
+        
     markup = types.InlineKeyboardMarkup(row_width=4)
     buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
     markup.add(*buttons)
-    text = "Выбери группу:" if is_group_chat else "Выбери свою группу:"
+    markup.add(types.InlineKeyboardButton(text="🔍 Найти преподавателя", callback_data="search_teacher"))
+
+    text = "Выбери группу или нажми поиск препода:" if is_group_chat else "Выбери свою группу:"
+    
     if message_id:
         try: bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
         except: bot.send_message(chat_id, text, reply_markup=markup)
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
 
+# --- КОМАНДЫ ---
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
     is_private = message.chat.type == 'private'
@@ -141,11 +149,17 @@ def start_message(message):
         bot.send_message(message.chat.id, f"👋 Привет, {message.from_user.first_name}!\nЯ бот с расписанием.", reply_markup=markup)
     else:
         bot.send_message(message.chat.id, "👋 Привет всем! Я бот с расписанием.")
-    send_group_keyboard(message.chat.id, is_group_chat=not is_private)
+    
+    send_main_keyboard(message.chat.id, is_group_chat=not is_private)
 
 @bot.message_handler(commands=['schedule'])
 def schedule_command(message):
-    send_group_keyboard(message.chat.id, is_group_chat=(message.chat.type != 'private'))
+    send_main_keyboard(message.chat.id, is_group_chat=(message.chat.type != 'private'))
+
+@bot.message_handler(commands=['search'])
+def search_command(message):
+    msg = bot.send_message(message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, search_teacher_text)
 
 # --- ОБРАБОТКА ТЕКСТОВЫХ КОМАНД ---
 @bot.message_handler(content_types=['text'])
@@ -154,10 +168,10 @@ def handle_text(message):
         return 
 
     if message.text == "ℹ️ Помощь":
-        bot.send_message(message.chat.id, "📌 *Команды:*\n/start - Меню\n📅 Моё расписание - Список групп\n⏰ Следующая пара - Что сейчас идет\n🔍 Поиск препода - Найти пары преподавателя")
+        bot.send_message(message.chat.id, "📌 *Команды:*\n/start - Меню\n/schedule - Список групп\n/search - Поиск препода\n⏰ Следующая пара - Что сейчас идет")
     
     elif message.text == "📅 Моё расписание" or message.text == "🔄 Сменить группу":
-        send_group_keyboard(message.chat.id)
+        send_main_keyboard(message.chat.id)
         
     elif message.text == "⏰ Следующая пара":
         hour = datetime.datetime.now().hour
@@ -173,7 +187,7 @@ def handle_text(message):
             bot.send_message(message.chat.id, "Сейчас не учебное время. Отдыхай! 🎉")
             return
 
-        bot.send_message(message.chat.id, f"⏰ Сейчас примерно {pair_num}-я пара. Выбери свою группу, чтобы узнать подробности:")
+        bot.send_message(message.chat.id, f"⏰ Сейчас примерно {pair_num}-я пара. Выбери свою группу:")
         markup = types.InlineKeyboardMarkup(row_width=4)
         buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
         markup.add(*buttons)
@@ -181,9 +195,9 @@ def handle_text(message):
 
     elif message.text == "🔍 Поиск препода":
         msg = bot.send_message(message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, search_teacher)
+        bot.register_next_step_handler(msg, search_teacher_text)
 
-def search_teacher(message):
+def search_teacher_text(message):
     teacher_query = message.text.strip().lower()
     if not teacher_query or len(teacher_query) < 2:
         bot.send_message(message.chat.id, "Слишком короткий запрос. Попробуй снова.")
@@ -213,8 +227,15 @@ def search_teacher(message):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     data = call.data
+    
     if data == "back":
-        send_group_keyboard(call.message.chat.id, message_id=call.message.message_id, is_group_chat=(call.message.chat.type != 'private'))
+        send_main_keyboard(call.message.chat.id, message_id=call.message.message_id, is_group_chat=(call.message.chat.type != 'private'))
+        return
+
+    if data == "search_teacher":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, search_teacher_text)
         return
 
     action, group = data.split("_", 1)
@@ -232,7 +253,7 @@ def callback_query(call):
             text += "🎉 Сегодня пар нет! Отдыхай."
 
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(text="🔄 Выбрать другую", callback_data="back"))
+        markup.add(types.InlineKeyboardButton(text="🔄 Назад", callback_data="back"))
         
         try:
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
@@ -242,13 +263,31 @@ def callback_query(call):
     bot.answer_callback_query(call.id)
 
 # ==========================================
-# 5. ЗАПУСК
+# 5. УСТАНОВКА МЕНЮ КОМАНД И ЗАПУСК
 # ==========================================
+def set_bot_commands():
+    """Регистрирует команды в меню Telegram (кнопка слеш)"""
+    commands = [
+        types.BotCommand("start", "Запустить бота / Главное меню"),
+        types.BotCommand("schedule", "Показать список групп"),
+        types.BotCommand("search", "Найти расписание преподавателя"),
+        types.BotCommand("help", "Помощь по командам")
+    ]
+    try:
+        bot.set_my_commands(commands)
+        print("Меню команд успешно установлено!")
+    except Exception as e:
+        print(f"Ошибка при установке меню: {e}")
+
 if __name__ == '__main__':
     print("Первичная загрузка данных...")
     initial_data = fetch_schedule()
     if initial_data:
         DATA = initial_data
+        
+        # Устанавливаем меню команд
+        set_bot_commands()
+        
         update_thread = threading.Thread(target=auto_update_task)
         update_thread.daemon = True 
         update_thread.start()
