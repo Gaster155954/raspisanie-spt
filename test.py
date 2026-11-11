@@ -3,24 +3,27 @@ import telebot
 from telebot import types
 import requests
 from bs4 import BeautifulSoup
+import datetime
 
 # ==========================================
 # 1. НАСТРОЙКИ
 # ==========================================
-# Railway (и другие серверы) будут брать токен из настроек переменных окружения
 TOKEN = os.environ.get('BOT_TOKEN')
 
 if not TOKEN:
     print("ОШИБКА: Не найден BOT_TOKEN в переменных окружения!")
     exit(1)
 
-URL = "https://schedule.spt42.ru/2_korpus/hg.htm"
+# Ссылки на страницы сайта
+URL_DAY = "https://schedule.spt42.ru/2_korpus/hg.htm"      # На день
+URL_WEEK = "https://schedule.spt42.ru/2_korpus/hg_week.htm" # На неделю (предполагаемый адрес)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 # ==========================================
-# 2. ПАРСЕР РАСПИСАНИЯ (Твой рабочий код)
+# 2. ПАРСЕР РАСПИСАНИЯ (Универсальный)
 # ==========================================
 def parse_cell_text(cell):
     text = cell.get_text(separator="\n", strip=True)
@@ -54,14 +57,13 @@ def parse_cell_text(cell):
 
     return {"subject": subject, "room": room, "teacher": teacher}
 
-def fetch_schedule():
-    print("Загрузка данных с сайта...")
+def fetch_schedule(url):
     try:
-        response = requests.get(URL, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=10)
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, "html.parser")
     except Exception as e:
-        print(f"Ошибка подключения к сайту: {e}")
+        print(f"Ошибка подключения к {url}: {e}")
         return {}
 
     groups_data = {}
@@ -101,78 +103,106 @@ def fetch_schedule():
                     parsed = parse_cell_text(cells[1])
                     if parsed: groups_data[current_group].append((texts[0], parsed))
 
-    print("Данные успешно загружены!")
     return groups_data
+
+# Загружаем оба расписания при старте
+print("Загрузка расписания на день...")
+DATA_DAY = fetch_schedule(URL_DAY)
+print("Загрузка расписания на неделю...")
+DATA_WEEK = fetch_schedule(URL_WEEK)
+
+bot = telebot.TeleBot(TOKEN)
+
+# Хранилище для выбранных групп (чтобы знать, какую группу показывать)
+user_groups = {}
 
 # ==========================================
 # 3. ЛОГИКА БОТА
 # ==========================================
-bot = telebot.TeleBot(TOKEN)
-DATA = fetch_schedule()
-
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
-    if not DATA:
+    if not DATA_DAY:
         bot.send_message(message.chat.id, "❌ Ошибка: не удалось загрузить расписание.")
         return
 
-    # Создаем кнопки с группами
     markup = types.InlineKeyboardMarkup(row_width=4)
-    buttons = []
-    for group in sorted(DATA.keys()):
-        buttons.append(types.InlineKeyboardButton(text=group, callback_data=group))
+    buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA_DAY.keys())]
     markup.add(*buttons)
     
     bot.send_message(
         message.chat.id, 
-        f"👋 Привет, {message.from_user.first_name}!\nВыбери свою группу, чтобы узнать расписание на сегодня:", 
+        f"👋 Привет, {message.from_user.first_name}!\nВыбери свою группу:", 
         reply_markup=markup
     )
 
+# --- Функция для генерации текста расписания ---
+def generate_schedule_text(group, mode):
+    if mode == "day":
+        lessons = DATA_DAY.get(group, [])
+        title = f"📅 *Расписание на сегодня*\n👥 *Группа: {group}*\n\n"
+        empty_msg = "Сегодня пар нет (свободный день) 🎉"
+        # Кнопка переключения на неделю
+        switch_btn = types.InlineKeyboardButton(text="📅 На всю неделю", callback_data=f"w_{group}")
+    else:
+        lessons = DATA_WEEK.get(group, [])
+        title = f"🗓 *Расписание на неделю*\n👥 *Группа: {group}*\n\n"
+        empty_msg = "На неделю пар нет 🎉"
+        # Кнопка переключения на день
+        switch_btn = types.InlineKeyboardButton(text="📅 На сегодня", callback_data=f"d_{group}")
+
+    text = title
+    if lessons:
+        for pair_num, info in lessons:
+            text += f"🔔 *Пара {pair_num}*\n"
+            text += f"📚 {info['subject']}\n"
+            text += f"👨‍🏫 {info['teacher']}\n"
+            text += f"🚪 Ауд: {info['room']}\n\n"
+    else:
+        text += empty_msg
+
+    # Формируем кнопки
+    markup = types.InlineKeyboardMarkup()
+    markup.add(switch_btn)
+    markup.add(types.InlineKeyboardButton(text="🔄 Выбрать другую группу", callback_data="back"))
+    
+    return text, markup
+
+# --- Обработчик кнопок ---
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    group = call.data
-    
-    if group == "back":
-        # Возвращаем меню с группами
+    data = call.data
+
+    # Если нажали "Назад" к списку групп
+    if data == "back":
         markup = types.InlineKeyboardMarkup(row_width=4)
-        buttons = [types.InlineKeyboardButton(text=g, callback_data=g) for g in sorted(DATA.keys())]
+        buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA_DAY.keys())]
         markup.add(*buttons)
-        bot.edit_message_text(
-            "Выбери свою группу:", 
-            call.message.chat.id, 
-            call.message.message_id, 
-            reply_markup=markup
-        )
+        bot.edit_message_text("Выбери свою группу:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         return
 
-    if group in DATA:
-        lessons = DATA[group]
-        text = f"📅 *Расписание на сегодня*\n👥 *Группа: {group}*\n\n"
-        
-        if lessons:
-            for pair_num, info in lessons:
-                text += f"🔔 *Пара {pair_num}*\n"
-                text += f"📚 {info['subject']}\n"
-                text += f"👨‍🏫 {info['teacher']}\n"
-                text += f"🚪 Ауд: {info['room']}\n\n"
-        else:
-            text += "Сегодня пар нет (свободный день) 🎉"
-        
-        # Кнопка "Назад"
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(text="🔄 Выбрать другую группу", callback_data="back"))
-        
-        bot.send_message(call.message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
+    # Обработка выбора группы, дня или недели
+    action, group = data.split("_", 1)
     
+    if action == "g":
+        # По умолчанию показываем день
+        text, markup = generate_schedule_text(group, "day")
+        user_groups[call.message.chat.id] = group # Запоминаем выбор
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+    elif action == "w":
+        text, markup = generate_schedule_text(group, "week")
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+    elif action == "d":
+        text, markup = generate_schedule_text(group, "day")
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+
     bot.answer_callback_query(call.id)
 
 # ==========================================
 # 4. ЗАПУСК
 # ==========================================
 if __name__ == '__main__':
-    if DATA:
-        print("Бот запущен и готов к работе! Ждем сообщений...")
+    if DATA_DAY or DATA_WEEK:
+        print("Бот запущен!")
         bot.polling(none_stop=True)
     else:
-        print("Бот не запущен, так как не удалось спарсить расписание.")
+        print("Бот не запущен (нет данных).")
