@@ -19,7 +19,7 @@ HEADERS = {
 }
 
 # ==========================================
-# 2. ПАРСЕР (Оставляем без изменений)
+# 2. ПАРСЕР
 # ==========================================
 def parse_cell_text(cell):
     text = cell.get_text(separator="\n", strip=True)
@@ -93,62 +93,83 @@ DATA = fetch_schedule()
 bot = telebot.TeleBot(TOKEN)
 
 # ==========================================
-# 3. ЛОГИКА И ИНТЕРФЕЙС
+# 3. ЛОГИКА БОТА
 # ==========================================
 
-# Команда /start
+# Отправка списка групп (Inline-кнопки)
+def send_group_keyboard(chat_id, is_group_chat=False):
+    markup = types.InlineKeyboardMarkup(row_width=4)
+    buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
+    markup.add(*buttons)
+    
+    if is_group_chat:
+        bot.send_message(chat_id, "Выбери группу, чтобы посмотреть расписание:", reply_markup=markup)
+    else:
+        bot.send_message(chat_id, "Выбери свою группу:", reply_markup=markup)
+
+# --- Команды ---
+
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
     if not DATA:
         bot.send_message(message.chat.id, "❌ Ошибка: не удалось загрузить расписание.")
         return
 
-    # Создаем Reply-кнопки (появляются внизу)
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_help = types.KeyboardButton("ℹ️ Помощь")
-    btn_change = types.KeyboardButton("🔄 Сменить группу")
-    btn_schedule = types.KeyboardButton("📅 Моё расписание")
-    markup.add(btn_schedule, btn_change, btn_help)
+    is_private = message.chat.type == 'private'
 
-    bot.send_message(
-        message.chat.id, 
-        f"👋 Привет, {message.from_user.first_name}!\nЯ бот с расписанием.\nВыбери свою группу, чтобы начать:",
-        reply_markup=markup
-    )
-    send_group_keyboard(message.chat.id)
+    if is_private:
+        # Личный чат: красивое меню с кнопками внизу
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        markup.add(
+            types.KeyboardButton("📅 Моё расписание"),
+            types.KeyboardButton("🔄 Сменить группу"),
+            types.KeyboardButton("ℹ️ Помощь")
+        )
+        bot.send_message(
+            message.chat.id, 
+            f"👋 Привет, {message.from_user.first_name}!\nЯ бот с расписанием.\nНажми на кнопку ниже или выбери группу из списка.",
+            reply_markup=markup
+        )
+        send_group_keyboard(message.chat.id, is_group_chat=False)
+    else:
+        # Группа: без лишних меню, просто кнопки выбора
+        bot.send_message(message.chat.id, "👋 Привет всем! Я бот с расписанием. Выберите группу:")
+        send_group_keyboard(message.chat.id, is_group_chat=True)
 
-# Отправка списка групп (Inline)
-def send_group_keyboard(chat_id):
-    markup = types.InlineKeyboardMarkup(row_width=4)
-    buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
-    markup.add(*buttons)
-    bot.send_message(chat_id, "Выбери группу:", reply_markup=markup)
+# Команда /schedule (специально для групп)
+@bot.message_handler(commands=['schedule', 'расписание'])
+def schedule_command(message):
+    send_group_keyboard(message.chat.id, is_group_chat=(message.chat.type != 'private'))
 
-# Обработка текстовых кнопок (снизу)
+# Обработка обычных текстовых сообщений
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    if message.text == "ℹ️ Помощь":
-        bot.send_message(message.chat.id, "📌 *Как пользоваться:*\n1. Выбери группу.\n2. Наслаждайся расписанием.\n\nДля добавления бота в беседу: просто добавь его как участника и напиши `/start`.")
-    elif message.text == "🔄 Сменить группу":
-        send_group_keyboard(message.chat.id)
-    elif message.text == "📅 Моё расписание":
-        bot.send_message(message.chat.id, "Пока не могу сохранить твою группу навсегда (напиши в поддержку 😉). Но ты можешь выбрать группу заново.")
+    if message.chat.type != 'private':
+        return # Игнорируем болтовню в группах
 
-# Обработка Inline-кнопок (выбор группы)
+    if message.text == "ℹ️ Помощь":
+        bot.send_message(message.chat.id, "📌 *Как пользоваться:*\n1. Выбери группу.\n2. Наслаждайся расписанием.")
+    elif message.text == "🔄 Сменить группу":
+        send_group_keyboard(message.chat.id, is_group_chat=False)
+    elif message.text == "📅 Моё расписание":
+        # Показываем список групп еще раз, если пользователь еще не выбрал
+        send_group_keyboard(message.chat.id, is_group_chat=False)
+
+# Обработка нажатий на Inline-кнопки
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     data = call.data
+    
     if data == "back":
-        send_group_keyboard(call.message.chat.id)
+        send_group_keyboard(call.message.chat.id, is_group_chat=(call.message.chat.type != 'private'))
         return
 
     action, group = data.split("_", 1)
     if action == "g":
         lessons = DATA.get(group, [])
         
-        # Красивое форматирование
         text = f"👥 *Группа: {group}*\n"
-        text += f"📅 *Дата: Сегодня* (Обновлено с сайта)\n\n"
+        text += f"📅 *Дата: Сегодня*\n\n"
         
         if lessons:
             for pair_num, info in lessons:
@@ -160,7 +181,7 @@ def callback_query(call):
             text += "🎉 Сегодня пар нет! Отдыхай."
 
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(text="🔄 Выбрать другую группу", callback_data="back"))
+        markup.add(types.InlineKeyboardButton(text="🔄 Выбрать другую", callback_data="back"))
         
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
     
