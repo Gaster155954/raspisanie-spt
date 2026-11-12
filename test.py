@@ -2,8 +2,9 @@ import os
 import telebot
 from telebot import types
 import requests
+from bs4 import BeautifulSoup
 import io
-import time
+import re
 
 # ==========================================
 # 1. НАСТРОЙКИ
@@ -11,140 +12,123 @@ import time
 TOKEN = os.environ.get('BOT_TOKEN')
 
 if not TOKEN:
-    print("ОШИБКА: Не найден BOT_TOKEN в переменных окружения!")
+    print("ОШИБКА: Не найден BOT_TOKEN")
     exit(1)
 
 bot = telebot.TeleBot(TOKEN)
 
 # ==========================================
-# 2. БАЗА МЕМОВ (Прямые ссылки на MP3)
+# 2. ЖИВОЙ ПОИСК ЗВУКОВ (Парсер Myinstants)
 # ==========================================
-# Я подобрал рабочие ссылки на популярные звуки
-MEMES = {
-    "litvin": {
-        "name": "Литвин (Делай!)",
-        "url": "https://www.myinstants.com/media/sounds/litvin-delai.mp3" 
-    },
-    "mellstroy": {
-        "name": "Меллстрой (Бурмалда)",
-        "url": "https://www.myinstants.com/media/sounds/mellstroy-burmaldа.mp3"
-    },
-    "mrbeast": {
-        "name": "MrBeast (Rizz)",
-        "url": "https://www.myinstants.com/media/sounds/mrbeast-rizz.mp3"
-    },
-    "vineboom": {
-        "name": "Vine Boom",
-        "url": "https://www.myinstants.com/media/sounds/vine-boom.mp3"
-    },
-    "bruh": {
-        "name": "Bruh",
-        "url": "https://www.myinstants.com/media/sounds/bruh-sound-effect.mp3"
-    },
-    "fart": {
-        "name": "Пукан",
-        "url": "https://www.myinstants.com/media/sounds/fart-with-reverb.mp3"
-    },
-    "windows": {
-        "name": "Windows XP",
-        "url": "https://www.myinstants.com/media/sounds/windows-xp-startup.mp3"
+def search_and_download_sound(query):
+    """Ищет звук на Myinstants и возвращает байты MP3"""
+    # Кодируем запрос для URL
+    encoded_query = requests.utils.quote(query)
+    url = f"https://www.myinstants.com/en/search/?name={encoded_query}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-}
+    
+    try:
+        # 1. Загружаем страницу поиска
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # 2. Ищем первую кнопку со звуком
+        # На Myinstants кнопки обычно имеют класс 'small-button' и атрибут onclick
+        button = soup.find("button", class_="small-button")
+        if not button:
+            return None, "Не найдено"
+            
+        onclick_text = button.get("onclick", "")
+        
+        # 3. Вытаскиваем путь к MP3 из onclick (формат: play('/media/sounds/...mp3'))
+        match = re.search(r"play\('([^']+\.mp3)'\)", onclick_text)
+        if not match:
+            return None, "Ошибка парсинга ссылки"
+            
+        sound_path = match.group(1)
+        # Собираем полную ссылку
+        if sound_path.startswith("/"):
+            sound_url = f"https://www.myinstants.com{sound_path}"
+        else:
+            sound_url = f"https://www.myinstants.com/{sound_path}"
+            
+        # 4. Скачиваем сам файл MP3
+        audio_response = requests.get(sound_url, headers=headers, timeout=15)
+        audio_response.raise_for_status()
+        
+        return audio_response.content, None
+        
+    except Exception as e:
+        print(f"Ошибка поиска: {e}")
+        return None, str(e)
 
 # ==========================================
 # 3. ЛОГИКА БОТА
 # ==========================================
-
-# Главное меню (Reply-кнопки)
-def get_main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    # Берем первые 6 мемов для кнопок
-    keys = list(MEMES.keys())[:6]
-    for key in keys:
-        markup.add(types.KeyboardButton(MEMES[key]["name"]))
-    return markup
-
-# Отправка звука
-def send_meme_sound(chat_id, meme_key, message_id=None):
-    meme = MEMES.get(meme_key)
-    if not meme:
-        bot.send_message(chat_id, "❌ Звук не найден.")
-        return
-
-    # Отправляем сообщение "печатает" (загружает голосовое)
-    bot.send_chat_action(chat_id, 'record_voice')
-    
-    try:
-        # 1. Скачиваем MP3
-        response = requests.get(meme["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        response.raise_for_status()
-        
-        # 2. Сохраняем в память
-        audio_file = io.BytesIO(response.content)
-        audio_file.name = f"{meme_key}.mp3"
-        
-        # 3. Отправляем как голосовое сообщение (voice)
-        # В Telegram это выглядит как кружок с волной
-        sent_msg = bot.send_voice(
-            chat_id, 
-            audio_file, 
-            caption=f"🔊 *{meme['name']}*", 
-            parse_mode='Markdown'
-        )
-        
-        # 4. Добавляем кнопки "Ещё мемы" под сообщением (Inline)
-        markup = types.InlineKeyboardMarkup(row_width=3)
-        inline_buttons = []
-        for k, v in MEMES.items():
-            inline_buttons.append(types.InlineKeyboardButton(text=v["name"], callback_data=f"play_{k}"))
-        markup.add(*inline_buttons)
-        
-        bot.edit_message_reply_markup(chat_id, sent_msg.message_id, reply_markup=markup)
-        
-    except Exception as e:
-        print(f"Ошибка при отправке: {e}")
-        bot.send_message(chat_id, "⚠️ Не удалось скачать звук. Возможно, ссылка устарела.")
-
-# ==========================================
-# 4. ОБРАБОТЧИКИ
-# ==========================================
-
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
+    # Оставляем пару кнопок для быстрого доступа к самым хайповым мемам
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("Tung Tung Sahur"),
+        types.KeyboardButton("Bombardiro Crocodilo"),
+        types.KeyboardButton("MrBeast"),
+        types.KeyboardButton("Mellstroy")
+    )
+    
     bot.send_message(
         message.chat.id,
-        "👋 Привет! Я бот с мемными звуками.\n"
-        "Выбери мем на клавиатуре снизу или нажми на кнопку в сообщении, "
-        "чтобы я прислал тебе звук! 🔊",
-        reply_markup=get_main_menu()
+        "👋 Привет! Я бот с живым поиском мемных звуков.\n\n"
+        "Напиши мне **любое слово** (на английском или русском), и я поищу его в огромной базе Myinstants и пришлю тебе звук! 🔍\n\n"
+        "Например: `litvin`, `rizz`, `bruh`, `tralalero` или `skibidi`.\n"
+        "Или нажми на кнопку с горячим мемом ниже.",
+        reply_markup=markup,
+        parse_mode='Markdown'
     )
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    # Ищем, к какому мему относится текст
-    selected_key = None
-    for key, value in MEMES.items():
-        if message.text == value["name"]:
-            selected_key = key
-            break
-            
-    if selected_key:
-        send_meme_sound(message.chat.id, selected_key)
-    else:
-        bot.send_message(message.chat.id, "🤷‍♂️ Я знаю только мемы с кнопок. Выбери один из них!")
+    query = message.text.strip()
+    
+    # Игнорируем команды
+    if query.startswith('/'):
+        return
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    # Обработка нажатий на Inline-кнопки (play_xxx)
-    if call.data.startswith("play_"):
-        meme_key = call.data.replace("play_", "")
-        send_meme_sound(call.message.chat.id, meme_key)
-        
-    bot.answer_callback_query(call.id)
+    # Показываем, что бот "печатает"
+    bot.send_chat_action(message.chat.id, 'upload_voice')
+    
+    # Ищем и скачиваем звук
+    audio_bytes, error = search_and_download_sound(query)
+    
+    if audio_bytes:
+        try:
+            # Отправляем как голосовое сообщение (кружок с волной)
+            audio_file = io.BytesIO(audio_bytes)
+            audio_file.name = f"{query}.mp3"
+            
+            bot.send_voice(
+                message.chat.id, 
+                audio_file, 
+                caption=f"🔊 Найдено по запросу: *{query}*", 
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            print(f"Ошибка отправки: {e}")
+            bot.send_message(message.chat.id, "❌ Звук найден, но не удалось отправить. Попробуй другой запрос.")
+    else:
+        # Если ничего не нашли или произошла ошибка
+        if error == "Не найдено":
+            bot.send_message(message.chat.id, f"🤷‍♂️ По запросу `{query}` ничего не найдено. Попробуй написать по-другому (лучше на английском).")
+        else:
+            bot.send_message(message.chat.id, "⚠️ Произошла ошибка при поиске. Попробуй позже или другой запрос.")
 
 # ==========================================
-# 5. ЗАПУСК
+# 4. ЗАПУСК
 # ==========================================
 if __name__ == '__main__':
-    print("Бот с мемами запущен!")
+    print("Бот с живым поиском мемов запущен!")
     bot.polling(none_stop=True)
