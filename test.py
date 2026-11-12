@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 import threading
 import time
 import datetime
+import re
 
 # ==========================================
 # 1. НАСТРОЙКИ
@@ -23,9 +24,33 @@ HEADERS = {
 
 UPDATE_INTERVAL = 1800  # Автообновление раз в 30 минут
 
+# ИСПРАВЛЕННОЕ ВРЕМЯ ЗВОНКОВ (по твоим данным)
+BELL_TIMES = {
+    "1": "08:30 - 09:50",
+    "2": "10:00 - 11:20",
+    "3": "11:40 - 13:00",
+    "4": "13:20 - 14:40",
+    "5": "14:50 - 16:10",
+    "6": "16:15 - 17:35",
+    "7": "17:40 - 19:00",
+    "8": "19:00 - 20:20" # На случай 8-й пары, если она будет
+}
+
 # ==========================================
-# 2. ПАРСЕР
+# 2. ПАРСЕР И ОБРАБОТКА ДАННЫХ
 # ==========================================
+def shorten_teacher(name):
+    """Сокращает 'Тунгусов Сергей Владимирович' до 'Тунгусов С.В.'"""
+    parts = name.strip().split()
+    if len(parts) >= 3:
+        return f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    return name
+
+def shorten_subject(subject):
+    """Убирает лишние префиксы из названия предмета"""
+    cleaned = re.sub(r'^(МДК|УП|ПМ|ОП)\.?\s*[\d\.]*\s*', '', subject, flags=re.IGNORECASE)
+    return cleaned.strip()
+
 def parse_cell_text(cell):
     text = cell.get_text(separator="\n", strip=True)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -51,7 +76,12 @@ def parse_cell_text(cell):
                 teacher_parts.append(line)
         teacher = " ".join(teacher_parts).strip()
         if not teacher: teacher = "Не указан"
-    return {"subject": subject, "room": room, "teacher": teacher}
+        
+    return {
+        "subject": shorten_subject(subject), 
+        "room": room, 
+        "teacher": shorten_teacher(teacher)
+    }
 
 def fetch_schedule():
     try:
@@ -117,14 +147,11 @@ def auto_update_task():
 # ==========================================
 bot = telebot.TeleBot(TOKEN)
 
-# Функция безопасного редактирования (чтобы не спамить)
 def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
     try:
         bot.edit_message_text(text, chat_id, message_id, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception:
-        # Если сообщение старое или не изменилось, удаляем и отправляем новое
-        try:
-            bot.delete_message(chat_id, message_id)
+        try: bot.delete_message(chat_id, message_id)
         except: pass
         bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
 
@@ -145,7 +172,6 @@ def send_main_keyboard(chat_id, message_id=None, is_group_chat=False):
     else:
         bot.send_message(chat_id, text, reply_markup=markup)
 
-# --- КОМАНДЫ ---
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
     is_private = message.chat.type == 'private'
@@ -159,7 +185,6 @@ def start_message(message):
         )
         bot.send_message(message.chat.id, f"👋 Привет, {message.from_user.first_name}!\nЯ бот с расписанием.", reply_markup=markup)
     else:
-        # В группе не спамим огромным меню, отправляем одно сообщение
         bot.send_message(message.chat.id, "👋 Привет всем! Я бот с расписанием. Выбери группу ниже:")
     
     send_main_keyboard(message.chat.id, is_group_chat=not is_private)
@@ -173,7 +198,6 @@ def search_command(message):
     msg = bot.send_message(message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
     bot.register_next_step_handler(msg, search_teacher_text)
 
-# --- ОБРАБОТКА ТЕКСТОВЫХ КОМАНД ---
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     if message.chat.type != 'private':
@@ -223,18 +247,17 @@ def search_teacher_text(message):
                 found_lessons.append((group, pair_num, info))
     
     if not found_lessons:
-        bot.send_message(message.chat.id, "Ничего не найдено. Возможно, сегодня у него нет пар или фамилия написана иначе.")
+        bot.send_message(message.chat.id, "Ничего не найдено. Возможно, сегодня у него нет пар.")
         return
         
     text = f"👨‍🏫 *Найдено расписание для '{message.text}':*\n\n"
     for group, pair_num, info in found_lessons:
-        text += f"👥 *Группа {group}* ({pair_num} пара)\n"
-        text += f"📚 {info['subject']}\n"
-        text += f"🚪 Ауд: {info['room']}\n\n"
+        time_str = BELL_TIMES.get(pair_num, "")
+        text += f"👥 *{group}* | {pair_num} пара ({time_str})\n"
+        text += f"📚 {info['subject']} (ауд. {info['room']})\n\n"
         
     bot.send_message(message.chat.id, text, parse_mode='Markdown')
 
-# --- ОБРАБОТКА ИНЛАЙН-КНОПОК ---
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     data = call.data
@@ -256,24 +279,20 @@ def callback_query(call):
         
         if lessons:
             for pair_num, info in lessons:
-                text += f"*{pair_num} пара* ──────────────\n"
-                text += f"📚 {info['subject']}\n"
-                text += f"👨‍🏫 {info['teacher']}\n"
-                text += f"🚪 Ауд: `{info['room']}`\n\n"
+                time_str = BELL_TIMES.get(pair_num, "")
+                text += f"⏰ *{pair_num} пара* ({time_str})\n"
+                text += f"📚 {info['subject']} | ауд. `{info['room']}`\n"
+                text += f"👨‍🏫 {info['teacher']}\n\n"
         else:
             text += "🎉 Сегодня пар нет! Отдыхай."
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(text="🔄 Назад", callback_data="back"))
         
-        # Используем безопасное редактирование
         safe_edit_message(call.message.chat.id, call.message.message_id, text, parse_mode='Markdown', reply_markup=markup)
     
     bot.answer_callback_query(call.id)
 
-# ==========================================
-# 5. УСТАНОВКА МЕНЮ КОМАНД И ЗАПУСК
-# ==========================================
 def set_bot_commands():
     commands = [
         types.BotCommand("start", "Главное меню"),
@@ -283,7 +302,6 @@ def set_bot_commands():
     ]
     try:
         bot.set_my_commands(commands)
-        print("Меню команд установлено!")
     except Exception as e:
         print(f"Ошибка меню: {e}")
 
