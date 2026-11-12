@@ -3,8 +3,9 @@ import telebot
 from telebot import types
 import requests
 from bs4 import BeautifulSoup
-import io
-import re
+import threading
+import time
+import datetime
 
 # ==========================================
 # 1. НАСТРОЙКИ
@@ -12,123 +13,291 @@ import re
 TOKEN = os.environ.get('BOT_TOKEN')
 
 if not TOKEN:
-    print("ОШИБКА: Не найден BOT_TOKEN")
+    print("ОШИБКА: Не найден BOT_TOKEN в переменных окружения!")
     exit(1)
 
+URL_DAY = "https://schedule.spt42.ru/2_korpus/hg.htm"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+UPDATE_INTERVAL = 1800  # Автообновление раз в 30 минут
+
+# ==========================================
+# 2. ПАРСЕР
+# ==========================================
+def parse_cell_text(cell):
+    text = cell.get_text(separator="\n", strip=True)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if not lines: return None
+    subject = lines[0]
+    room = "Не указана"
+    teacher = "Не указан"
+    def is_room(word):
+        clean_word = word.strip(',.')
+        return clean_word.isdigit() or clean_word.startswith("с/п")
+    words0 = subject.split()
+    if words0 and is_room(words0[-1]):
+        room = words0[-1]
+        subject = " ".join(words0[:-1])
+    if len(lines) >= 2:
+        teacher_parts = []
+        for line in lines[1:]:
+            words = line.split()
+            if room == "Не указана" and words and is_room(words[0]):
+                room = words[0]
+                teacher_parts.append(" ".join(words[1:]))
+            else:
+                teacher_parts.append(line)
+        teacher = " ".join(teacher_parts).strip()
+        if not teacher: teacher = "Не указан"
+    return {"subject": subject, "room": room, "teacher": teacher}
+
+def fetch_schedule():
+    try:
+        response = requests.get(URL_DAY, headers=HEADERS, timeout=10)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        print(f"Ошибка подключения: {e}")
+        return None
+
+    groups_data = {}
+    current_group = None
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if not cells: continue
+        texts = [c.get_text(separator=" ", strip=True) for c in cells]
+        first_text = texts[0].upper()
+        
+        if not first_text: continue
+
+        if "-" in first_text and len(first_text) < 10 and " " not in first_text:
+            current_group = first_text
+            if current_group not in groups_data: groups_data[current_group] = []
+            if len(texts) >= 3:
+                if len(texts) > 3:
+                    for i in range(1, len(texts), 2):
+                        if texts[i].isdigit() and i+1 < len(texts):
+                            parsed = parse_cell_text(cells[i+1])
+                            if parsed: groups_data[current_group].append((texts[i], parsed))
+                else:
+                    if texts[1].isdigit():
+                        parsed = parse_cell_text(cells[2])
+                        if parsed: groups_data[current_group].append((texts[1], parsed))
+        elif current_group and texts and texts[0].isdigit():
+            if len(texts) >= 2:
+                if len(texts) > 2:
+                    for i in range(0, len(texts), 2):
+                        if texts[i].isdigit() and i+1 < len(texts):
+                            parsed = parse_cell_text(cells[i+1])
+                            if parsed: groups_data[current_group].append((texts[i], parsed))
+                else:
+                    parsed = parse_cell_text(cells[1])
+                    if parsed: groups_data[current_group].append((texts[0], parsed))
+    return groups_data
+
+# ==========================================
+# 3. АВТООБНОВЛЕНИЕ
+# ==========================================
+DATA = {}
+
+def auto_update_task():
+    global DATA
+    while True:
+        print("Фоновое обновление расписания...")
+        new_data = fetch_schedule()
+        if new_data: 
+            DATA = new_data
+            print(f"Расписание обновлено! Групп: {len(DATA)}")
+        time.sleep(UPDATE_INTERVAL)
+
+# ==========================================
+# 4. ЛОГИКА БОТА
+# ==========================================
 bot = telebot.TeleBot(TOKEN)
 
-# ==========================================
-# 2. ЖИВОЙ ПОИСК ЗВУКОВ (Парсер Myinstants)
-# ==========================================
-def search_and_download_sound(query):
-    """Ищет звук на Myinstants и возвращает байты MP3"""
-    # Кодируем запрос для URL
-    encoded_query = requests.utils.quote(query)
-    url = f"https://www.myinstants.com/en/search/?name={encoded_query}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
+# Функция безопасного редактирования (чтобы не спамить)
+def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
     try:
-        # 1. Загружаем страницу поиска
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        # 2. Ищем первую кнопку со звуком
-        # На Myinstants кнопки обычно имеют класс 'small-button' и атрибут onclick
-        button = soup.find("button", class_="small-button")
-        if not button:
-            return None, "Не найдено"
-            
-        onclick_text = button.get("onclick", "")
-        
-        # 3. Вытаскиваем путь к MP3 из onclick (формат: play('/media/sounds/...mp3'))
-        match = re.search(r"play\('([^']+\.mp3)'\)", onclick_text)
-        if not match:
-            return None, "Ошибка парсинга ссылки"
-            
-        sound_path = match.group(1)
-        # Собираем полную ссылку
-        if sound_path.startswith("/"):
-            sound_url = f"https://www.myinstants.com{sound_path}"
-        else:
-            sound_url = f"https://www.myinstants.com/{sound_path}"
-            
-        # 4. Скачиваем сам файл MP3
-        audio_response = requests.get(sound_url, headers=headers, timeout=15)
-        audio_response.raise_for_status()
-        
-        return audio_response.content, None
-        
-    except Exception as e:
-        print(f"Ошибка поиска: {e}")
-        return None, str(e)
+        bot.edit_message_text(text, chat_id, message_id, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception:
+        # Если сообщение старое или не изменилось, удаляем и отправляем новое
+        try:
+            bot.delete_message(chat_id, message_id)
+        except: pass
+        bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
 
-# ==========================================
-# 3. ЛОГИКА БОТА
-# ==========================================
+def send_main_keyboard(chat_id, message_id=None, is_group_chat=False):
+    if not DATA:
+        bot.send_message(chat_id, "⏳ Данные еще загружаются...")
+        return
+        
+    markup = types.InlineKeyboardMarkup(row_width=4)
+    buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
+    markup.add(*buttons)
+    markup.add(types.InlineKeyboardButton(text="🔍 Найти преподавателя", callback_data="search_teacher"))
+
+    text = "Выбери группу или нажми поиск препода:" if is_group_chat else "Выбери свою группу:"
+    
+    if message_id:
+        safe_edit_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup)
+
+# --- КОМАНДЫ ---
 @bot.message_handler(commands=['start', 'help'])
 def start_message(message):
-    # Оставляем пару кнопок для быстрого доступа к самым хайповым мемам
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("Tung Tung Sahur"),
-        types.KeyboardButton("Bombardiro Crocodilo"),
-        types.KeyboardButton("MrBeast"),
-        types.KeyboardButton("Mellstroy")
-    )
+    is_private = message.chat.type == 'private'
+    if is_private:
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        markup.add(
+            types.KeyboardButton("📅 Моё расписание"),
+            types.KeyboardButton("⏰ Следующая пара"),
+            types.KeyboardButton("🔍 Поиск препода"),
+            types.KeyboardButton("ℹ️ Помощь")
+        )
+        bot.send_message(message.chat.id, f"👋 Привет, {message.from_user.first_name}!\nЯ бот с расписанием.", reply_markup=markup)
+    else:
+        # В группе не спамим огромным меню, отправляем одно сообщение
+        bot.send_message(message.chat.id, "👋 Привет всем! Я бот с расписанием. Выбери группу ниже:")
     
-    bot.send_message(
-        message.chat.id,
-        "👋 Привет! Я бот с живым поиском мемных звуков.\n\n"
-        "Напиши мне **любое слово** (на английском или русском), и я поищу его в огромной базе Myinstants и пришлю тебе звук! 🔍\n\n"
-        "Например: `litvin`, `rizz`, `bruh`, `tralalero` или `skibidi`.\n"
-        "Или нажми на кнопку с горячим мемом ниже.",
-        reply_markup=markup,
-        parse_mode='Markdown'
-    )
+    send_main_keyboard(message.chat.id, is_group_chat=not is_private)
 
+@bot.message_handler(commands=['schedule'])
+def schedule_command(message):
+    send_main_keyboard(message.chat.id, is_group_chat=(message.chat.type != 'private'))
+
+@bot.message_handler(commands=['search'])
+def search_command(message):
+    msg = bot.send_message(message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
+    bot.register_next_step_handler(msg, search_teacher_text)
+
+# --- ОБРАБОТКА ТЕКСТОВЫХ КОМАНД ---
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    query = message.text.strip()
+    if message.chat.type != 'private':
+        return 
+
+    if message.text == "ℹ️ Помощь":
+        bot.send_message(message.chat.id, "📌 *Команды:*\n/start - Меню\n/schedule - Список групп\n/search - Поиск препода")
     
-    # Игнорируем команды
-    if query.startswith('/'):
+    elif message.text == "📅 Моё расписание" or message.text == "🔄 Сменить группу":
+        send_main_keyboard(message.chat.id)
+        
+    elif message.text == "⏰ Следующая пара":
+        hour = datetime.datetime.now().hour
+        pair_num = ""
+        if 8 <= hour < 10: pair_num = "1"
+        elif 10 <= hour < 12: pair_num = "2"
+        elif 12 <= hour < 14: pair_num = "3"
+        elif 14 <= hour < 16: pair_num = "4"
+        elif 16 <= hour < 18: pair_num = "5"
+        elif 18 <= hour < 20: pair_num = "6"
+        
+        if not pair_num:
+            bot.send_message(message.chat.id, "Сейчас не учебное время. Отдыхай! 🎉")
+            return
+
+        markup = types.InlineKeyboardMarkup(row_width=4)
+        buttons = [types.InlineKeyboardButton(text=g, callback_data=f"g_{g}") for g in sorted(DATA.keys())]
+        markup.add(*buttons)
+        bot.send_message(message.chat.id, f"⏰ Сейчас примерно {pair_num}-я пара. Выбери группу:", reply_markup=markup)
+
+    elif message.text == "🔍 Поиск препода":
+        msg = bot.send_message(message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, search_teacher_text)
+
+def search_teacher_text(message):
+    teacher_query = message.text.strip().lower()
+    if not teacher_query or len(teacher_query) < 2:
+        bot.send_message(message.chat.id, "Слишком короткий запрос. Попробуй снова.")
         return
 
-    # Показываем, что бот "печатает"
-    bot.send_chat_action(message.chat.id, 'upload_voice')
+    bot.send_message(message.chat.id, f"🔎 Ищу пары преподавателя: *{message.text}*...", parse_mode='Markdown')
     
-    # Ищем и скачиваем звук
-    audio_bytes, error = search_and_download_sound(query)
+    found_lessons = []
+    for group, lessons in DATA.items():
+        for pair_num, info in lessons:
+            if teacher_query in info['teacher'].lower():
+                found_lessons.append((group, pair_num, info))
     
-    if audio_bytes:
-        try:
-            # Отправляем как голосовое сообщение (кружок с волной)
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = f"{query}.mp3"
-            
-            bot.send_voice(
-                message.chat.id, 
-                audio_file, 
-                caption=f"🔊 Найдено по запросу: *{query}*", 
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            print(f"Ошибка отправки: {e}")
-            bot.send_message(message.chat.id, "❌ Звук найден, но не удалось отправить. Попробуй другой запрос.")
-    else:
-        # Если ничего не нашли или произошла ошибка
-        if error == "Не найдено":
-            bot.send_message(message.chat.id, f"🤷‍♂️ По запросу `{query}` ничего не найдено. Попробуй написать по-другому (лучше на английском).")
+    if not found_lessons:
+        bot.send_message(message.chat.id, "Ничего не найдено. Возможно, сегодня у него нет пар или фамилия написана иначе.")
+        return
+        
+    text = f"👨‍🏫 *Найдено расписание для '{message.text}':*\n\n"
+    for group, pair_num, info in found_lessons:
+        text += f"👥 *Группа {group}* ({pair_num} пара)\n"
+        text += f"📚 {info['subject']}\n"
+        text += f"🚪 Ауд: {info['room']}\n\n"
+        
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+# --- ОБРАБОТКА ИНЛАЙН-КНОПОК ---
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    data = call.data
+    
+    if data == "back":
+        send_main_keyboard(call.message.chat.id, message_id=call.message.message_id, is_group_chat=(call.message.chat.type != 'private'))
+        return
+
+    if data == "search_teacher":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "Введи фамилию преподавателя (например, *Тинькова*):", parse_mode='Markdown')
+        bot.register_next_step_handler(msg, search_teacher_text)
+        return
+
+    action, group = data.split("_", 1)
+    if action == "g":
+        lessons = DATA.get(group, [])
+        text = f"👥 *Группа: {group}*\n📅 *Расписание на сегодня*\n\n"
+        
+        if lessons:
+            for pair_num, info in lessons:
+                text += f"*{pair_num} пара* ──────────────\n"
+                text += f"📚 {info['subject']}\n"
+                text += f"👨‍🏫 {info['teacher']}\n"
+                text += f"🚪 Ауд: `{info['room']}`\n\n"
         else:
-            bot.send_message(message.chat.id, "⚠️ Произошла ошибка при поиске. Попробуй позже или другой запрос.")
+            text += "🎉 Сегодня пар нет! Отдыхай."
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(text="🔄 Назад", callback_data="back"))
+        
+        # Используем безопасное редактирование
+        safe_edit_message(call.message.chat.id, call.message.message_id, text, parse_mode='Markdown', reply_markup=markup)
+    
+    bot.answer_callback_query(call.id)
 
 # ==========================================
-# 4. ЗАПУСК
+# 5. УСТАНОВКА МЕНЮ КОМАНД И ЗАПУСК
 # ==========================================
+def set_bot_commands():
+    commands = [
+        types.BotCommand("start", "Главное меню"),
+        types.BotCommand("schedule", "Список групп"),
+        types.BotCommand("search", "Поиск преподавателя"),
+        types.BotCommand("help", "Помощь")
+    ]
+    try:
+        bot.set_my_commands(commands)
+        print("Меню команд установлено!")
+    except Exception as e:
+        print(f"Ошибка меню: {e}")
+
 if __name__ == '__main__':
-    print("Бот с живым поиском мемов запущен!")
-    bot.polling(none_stop=True)
+    print("Первичная загрузка данных...")
+    initial_data = fetch_schedule()
+    if initial_data:
+        DATA = initial_data
+        set_bot_commands()
+        
+        update_thread = threading.Thread(target=auto_update_task)
+        update_thread.daemon = True 
+        update_thread.start()
+        print("Бот запущен!")
+        bot.polling(none_stop=True)
+    else:
+        print("Бот не запущен (нет данных).")
